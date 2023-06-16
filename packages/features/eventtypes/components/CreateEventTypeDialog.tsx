@@ -70,7 +70,7 @@ const querySchema = z.object({
     .transform((jsonString) => locationFormSchema.parse(JSON.parse(jsonString)))
     .optional(),
   cardNumber: z.union([z.string().transform((val) => +val), z.number()]).optional(),
-  CVVnumber: z.union([z.string().transform((val) => +val), z.number()]).optional(),
+  cvvNumber: z.union([z.string().transform((val) => +val), z.number()]).optional(),
   expiryDate: z.union([z.string().transform((val) => +val), z.number()]).optional(),
 });
 
@@ -162,7 +162,7 @@ export default function CreateEventTypeDialog({
         "locations",
         "cardNumber",
         "expiryDate",
-        "CVVnumber",
+        "cvvNumber",
       ]}>
       <DialogContent
         type="creation"
@@ -192,7 +192,7 @@ export default function CreateEventTypeDialog({
                 placeholder="Enter CVV number"
                 label={t("CVV number")}
                 className="pr-4"
-                {...register("CVVnumber", { valueAsNumber: true })}
+                {...register("cvvNumber", { valueAsNumber: true })}
               />
               <TextField
                 type="date"
