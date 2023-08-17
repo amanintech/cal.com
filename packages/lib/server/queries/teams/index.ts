@@ -1,14 +1,21 @@
 import { Prisma } from "@prisma/client";
 
+import { getSlugOrRequestedSlug } from "@calcom/ee/organizations/lib/orgDomains";
 import prisma, { baseEventTypeSelect } from "@calcom/prisma";
 import { SchedulingType } from "@calcom/prisma/enums";
-import { EventTypeMetaDataSchema } from "@calcom/prisma/zod-utils";
+import { EventTypeMetaDataSchema, teamMetadataSchema } from "@calcom/prisma/zod-utils";
 
 import { WEBAPP_URL } from "../../../constants";
 
 export type TeamWithMembers = Awaited<ReturnType<typeof getTeamWithMembers>>;
 
-export async function getTeamWithMembers(id?: number, slug?: string, userId?: number) {
+export async function getTeamWithMembers(args: {
+  id?: number;
+  slug?: string;
+  userId?: number;
+  orgSlug?: string | null;
+}) {
+  const { id, slug, userId, orgSlug } = args;
   const userSelect = Prisma.validator<Prisma.UserSelect>()({
     username: true,
     email: true,
@@ -24,9 +31,12 @@ export async function getTeamWithMembers(id?: number, slug?: string, userId?: nu
     bio: true,
     hideBranding: true,
     hideBookATeamMember: true,
+    isPrivate: true,
     metadata: true,
     parent: {
       select: {
+        id: true,
+        slug: true,
         name: true,
         logo: true,
       },
@@ -76,11 +86,12 @@ export async function getTeamWithMembers(id?: number, slug?: string, userId?: nu
         ...baseEventTypeSelect,
       },
     },
-    inviteToken: {
+    inviteTokens: {
       select: {
         token: true,
         expires: true,
         expiresInDays: true,
+        identifier: true,
       },
     },
   });
@@ -88,6 +99,9 @@ export async function getTeamWithMembers(id?: number, slug?: string, userId?: nu
   const where: Prisma.TeamFindFirstArgs["where"] = {};
 
   if (userId) where.members = { some: { userId } };
+  if (orgSlug && orgSlug !== slug) {
+    where.parent = getSlugOrRequestedSlug(orgSlug);
+  }
   if (id) where.id = id;
   if (slug) where.slug = slug;
 
@@ -111,7 +125,16 @@ export async function getTeamWithMembers(id?: number, slug?: string, userId?: nu
     ...eventType,
     metadata: EventTypeMetaDataSchema.parse(eventType.metadata),
   }));
-  return { ...team, eventTypes, members };
+  /** Don't leak invite tokens to the frontend */
+  const { inviteTokens, ...teamWithoutInviteTokens } = team;
+  return {
+    ...teamWithoutInviteTokens,
+    /** To prevent breaking we only return non-email attached token here, if we have one */
+    inviteToken: inviteTokens.find((token) => token.identifier === "invite-link-for-teamId-" + team.id),
+    metadata: teamMetadataSchema.parse(team.metadata),
+    eventTypes,
+    members,
+  };
 }
 
 // also returns team

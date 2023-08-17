@@ -1,9 +1,12 @@
 import { type PrismaClient, Prisma } from "@prisma/client";
 import { orderBy } from "lodash";
 
+import { hasFilter } from "@calcom/features/filters/lib/hasFilter";
+import { checkRateLimitAndThrowError } from "@calcom/lib/checkRateLimitAndThrowError";
 import { CAL_URL } from "@calcom/lib/constants";
 import { markdownToSafeHTML } from "@calcom/lib/markdownToSafeHTML";
-import { baseEventTypeSelect, baseUserSelect } from "@calcom/prisma";
+import { getBookerUrl } from "@calcom/lib/server/getBookerUrl";
+import { baseEventTypeSelect } from "@calcom/prisma";
 import { MembershipRole, SchedulingType } from "@calcom/prisma/enums";
 import { teamMetadataSchema } from "@calcom/prisma/zod-utils";
 import { EventTypeMetaDataSchema } from "@calcom/prisma/zod-utils";
@@ -11,52 +14,74 @@ import { EventTypeMetaDataSchema } from "@calcom/prisma/zod-utils";
 import { TRPCError } from "@trpc/server";
 
 import type { TrpcSessionUser } from "../../../trpc";
+import type { TEventTypeInputSchema } from "./getByViewer.schema";
 
 type GetByViewerOptions = {
   ctx: {
     user: NonNullable<TrpcSessionUser>;
     prisma: PrismaClient;
   };
+  input: TEventTypeInputSchema;
 };
 
-export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
+const userSelect = Prisma.validator<Prisma.UserSelect>()({
+  id: true,
+  username: true,
+  name: true,
+});
+
+const eventTypeSelect = Prisma.validator<Prisma.EventTypeSelect>()({
+  // Position is required by lodash to sort on it. Don't remove it, TS won't complain but it would silently break reordering
+  position: true,
+  hashedLink: true,
+  locations: true,
+  destinationCalendar: true,
+  userId: true,
+  team: {
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+      // logo: true, // Skipping to avoid 4mb limit
+      bio: true,
+      hideBranding: true,
+    },
+  },
+  metadata: true,
+  users: {
+    select: userSelect,
+  },
+  children: {
+    include: {
+      users: {
+        select: userSelect,
+      },
+    },
+  },
+  parentId: true,
+  hosts: {
+    select: {
+      user: {
+        select: userSelect,
+      },
+    },
+  },
+  seatsPerTimeSlot: true,
+  ...baseEventTypeSelect,
+});
+
+export const compareMembership = (mship1: MembershipRole, mship2: MembershipRole) => {
+  const mshipToNumber = (mship: MembershipRole) =>
+    Object.keys(MembershipRole).findIndex((mmship) => mmship === mship);
+  return mshipToNumber(mship1) > mshipToNumber(mship2);
+};
+
+export const getByViewerHandler = async ({ ctx, input }: GetByViewerOptions) => {
   const { prisma } = ctx;
-  const eventTypeSelect = Prisma.validator<Prisma.EventTypeSelect>()({
-    // Position is required by lodash to sort on it. Don't remove it, TS won't complain but it would silently break reordering
-    position: true,
-    hashedLink: true,
-    locations: true,
-    destinationCalendar: true,
-    userId: true,
-    team: {
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        // logo: true, // Skipping to avoid 4mb limit
-        bio: true,
-        hideBranding: true,
-      },
-    },
-    metadata: true,
-    users: {
-      select: baseUserSelect,
-    },
-    children: {
-      include: {
-        users: true,
-      },
-    },
-    parentId: true,
-    hosts: {
-      select: {
-        user: {
-          select: baseUserSelect,
-        },
-      },
-    },
-    seatsPerTimeSlot: true,
-    ...baseEventTypeSelect,
+
+  await checkRateLimitAndThrowError({
+    identifier: `eventTypes:getByViewer:${ctx.user.id}`,
+    rateLimitingType: "common",
   });
 
   const user = await prisma.user.findUnique({
@@ -71,6 +96,7 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
       endTime: true,
       bufferTime: true,
       avatar: true,
+      organizationId: true,
       teams: {
         where: {
           accepted: true,
@@ -107,6 +133,7 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
       eventTypes: {
         where: {
           team: null,
+          userId: getPrismaWhereUserIdFromFilter(ctx.user.id, input?.filters),
         },
         select: eventTypeSelect,
         orderBy: [
@@ -133,23 +160,6 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
   });
 
   const userEventTypes = user.eventTypes.map(mapEventType);
-  // backwards compatibility, TMP:
-  const typesRaw = (
-    await prisma.eventType.findMany({
-      where: {
-        userId: ctx.user.id,
-      },
-      select: eventTypeSelect,
-      orderBy: [
-        {
-          position: "desc",
-        },
-        {
-          id: "asc",
-        },
-      ],
-    })
-  ).map(mapEventType);
 
   type EventTypeGroup = {
     teamId?: number | null;
@@ -167,14 +177,10 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
   };
 
   let eventTypeGroups: EventTypeGroup[] = [];
-  const eventTypesHashMap = userEventTypes.concat(typesRaw).reduce((hashMap, newItem) => {
-    const oldItem = hashMap[newItem.id];
-    hashMap[newItem.id] = { ...oldItem, ...newItem };
-    return hashMap;
-  }, {} as Record<number, EventTypeGroup["eventTypes"][number]>);
-  const mergedEventTypes = Object.values(eventTypesHashMap)
-    .map((eventType) => eventType)
-    .filter((evType) => evType.schedulingType !== SchedulingType.MANAGED);
+
+  const unmanagedEventTypes = userEventTypes.filter(
+    (evType) => evType.schedulingType !== SchedulingType.MANAGED
+  );
 
   const image = user?.username ? `${CAL_URL}/${user.username}/avatar.png` : undefined;
 
@@ -186,7 +192,7 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
       name: user.name,
       image,
     },
-    eventTypes: orderBy(mergedEventTypes, ["position", "id"], ["desc", "asc"]),
+    eventTypes: orderBy(unmanagedEventTypes, ["position", "id"], ["desc", "asc"]),
     metadata: {
       membershipCount: 1,
       readOnly: false,
@@ -198,10 +204,11 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
     membershipRole: membership.role,
   }));
 
-  const compareMembership = (mship1: MembershipRole, mship2: MembershipRole) => {
-    const mshipToNumber = (mship: MembershipRole) =>
-      Object.keys(MembershipRole).findIndex((mmship) => mmship === mship);
-    return mshipToNumber(mship1) > mshipToNumber(mship2);
+  const filterTeamsEventTypesBasedOnInput = (eventType: ReturnType<typeof mapEventType>) => {
+    if (!input?.filters || !hasFilter(input?.filters)) {
+      return true;
+    }
+    return input?.filters?.teamIds?.includes(eventType?.team?.id || 0) ?? false;
   };
 
   eventTypeGroups = ([] as EventTypeGroup[]).concat(
@@ -226,7 +233,7 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
             image: `${CAL_URL}/team/${membership.team.slug}/avatar.png`,
             slug: membership.team.slug
               ? !membership.team.parentId
-                ? `/team`
+                ? `team/${membership.team.slug}`
                 : "" + membership.team.slug
               : null,
           },
@@ -242,6 +249,7 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
           },
           eventTypes: membership.team.eventTypes
             .map(mapEventType)
+            .filter(filterTeamsEventTypesBasedOnInput)
             .filter((evType) => evType.userId === null || evType.userId === ctx.user.id)
             .filter((evType) =>
               membership.role === MembershipRole.MEMBER
@@ -251,6 +259,8 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
         };
       })
   );
+
+  const bookerUrl = await getBookerUrl(user);
   return {
     // don't display event teams without event types,
     eventTypeGroups: eventTypeGroups.filter((groupBy) => !!groupBy.eventTypes?.length),
@@ -260,7 +270,19 @@ export const getByViewerHandler = async ({ ctx }: GetByViewerOptions) => {
       ...group.metadata,
       teamId: group.teamId,
       membershipRole: group.membershipRole,
-      image: `${CAL_URL}/${group.profile.slug}/avatar.png`,
+      image: `${bookerUrl}${group.teamId ? "/team" : ""}/${group.profile.slug}/avatar.png`,
     })),
   };
 };
+
+export function getPrismaWhereUserIdFromFilter(
+  userId: number,
+  filters: NonNullable<TEventTypeInputSchema>["filters"] | undefined
+) {
+  if (!filters || !hasFilter(filters)) {
+    return userId;
+  } else if (filters.userIds?.[0] === userId) {
+    return userId;
+  }
+  return 0;
+}
